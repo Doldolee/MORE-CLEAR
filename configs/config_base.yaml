@@ -1,0 +1,4 @@
+num_actions : 25
+state_dim : 43 # 39(obs) + 4(demog)
+device : "cuda"
+seed : 2025
