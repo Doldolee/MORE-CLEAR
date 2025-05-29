@@ -21,18 +21,21 @@ Clone those repositories and save the generated datasets into the project's `dat
 ## Setup
 
 1. **Clone the repository**  
+
 ```bash
 git clone https://github.com/yourusername/MORE-CLEAR.git
 cd MORE-CLEAR
 ```
 
 2. **Data Preprocessing**
+
 Run the scripts in these repositories to preprocess MIMIC data.
 
 - [AI Clinician (MIMIC-III)](https://github.com/matthieukomorowski/AI_Clinician)  
 - [AI Clinician (MIMIC-IV)](https://github.com/cmudig/AI-Clinician-MIMICIV)  
 
 3. **Clinical Note Summarization**
+
 Use the summarization script to generate LLM-based note summaries:
 
 ```python
@@ -40,12 +43,14 @@ python ./dataset/summarize_llm.py
 ```
 
 4. **State Embedding**
+
 Generate clinical note state embeddings:
 ```python
 python ./dataset/embed_state.py
 ```
 
 5. **Training**
+
 Train the MORE-CLEAR RL agent:
 ```python
 python main.py
