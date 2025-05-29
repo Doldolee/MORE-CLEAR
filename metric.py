@@ -234,7 +234,6 @@ def eval_fqe_ci(algorithm,
     optimizer = torch.optim.Adam(fqe_Q.Q.parameters() if algorithm != 'IQL' else fqe_Q.critic1.parameters(), lr=lr)
     criterion = torch.nn.MSELoss()
 
-    # 2) 데이터 로딩
     N = replay_buffer.crt_size
     note       = torch.FloatTensor(replay_buffer.note[:N]).to(device)
     next_note  = torch.FloatTensor(replay_buffer.next_note[:N]).to(device)
