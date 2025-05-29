@@ -9,41 +9,20 @@ import cvxpy as cp
 from util import *
 
 def pred_q_value(algorithm, policy, state, note, note_bg_only):
-    if algorithm == 'ClinicalBert_BCQ' or algorithm == 'ClinicalBert_BCQ_Cross_Attention':
-        return policy.Q(state, note)[0]
-    elif algorithm == 'ClinicalBert_CQL_Cross_Attention':
-        return policy.Q(state, note)
-    elif algorithm == 'BCQ':
-        return policy.Q(state)[0]
-    elif algorithm == 'CQL':
+    if algorithm == 'CQL':
         return policy.Q(state)
     elif algorithm == 'ClinicalBert':
         return policy.Q(note)
-    elif algorithm == 'ClinicalBert_BCQ_Cross_Context_Attention':
-        return policy.Q(state, note, note_bg_only)[0]
     elif algorithm == 'ClinicalBert_CQL_Cross_Context_Attention':
         return policy.Q(state, note, note_bg_only)
-    elif algorithm == 'IQL':
-        q1 = policy.critic1(state)
-        q2 = policy.critic2(state)
-        min_q = torch.min(q1, q2)
-        return min_q
-    
+
 def pred_action(algorithm, policy, state, note, note_bg_only):
-    if algorithm == 'ClinicalBert_BCQ' or algorithm == 'ClinicalBert_BCQ_Cross_Attention' or algorithm=='ClinicalBert_CQL_Cross_Attention':
-        return policy.action(state, note)
-    elif algorithm == 'BCQ':
-        return policy.action(state)
-    elif algorithm == 'CQL':
+    if algorithm == 'CQL':
         return policy.action(state)
     elif algorithm == 'ClinicalBert':
         return policy.action(note)
-    elif algorithm == 'ClinicalBert_BCQ_Cross_Context_Attention':
-        return policy.action(state, note, note_bg_only)
     elif algorithm == 'ClinicalBert_CQL_Cross_Context_Attention':
         return policy.action(state, note, note_bg_only)
-    elif algorithm == 'IQL':
-        return policy.action(state)
 
 def collect_bellman_residuals(
     algorithm,
@@ -54,10 +33,8 @@ def collect_bellman_residuals(
     batch_size: int = 256,
 ):
 
-    if algorithm == 'IQL':
-        policy.actor.to(device);   policy.actor.eval()
-    else:
-        policy.Q.to(device);       policy.Q.eval()
+    policy.Q.to(device)
+    policy.Q.eval()
 
     N = replay_buffer.crt_size
 
@@ -119,11 +96,7 @@ def eval_policy_survival_rate(algorithm,
     rewards = torch.tensor(replay_buffer.reward[:N], dtype=torch.float32, device=device)
     dones   = torch.tensor(replay_buffer.done[:N],   dtype=torch.float32, device=device)
 
-    if algorithm == 'IQL':
-        policy.actor.eval()
-    else:
-        policy.Q.eval()
-
+    policy.Q.eval()
     ep_outcomes = []
     vaso_diffs  = []
     iv_diffs    = []
@@ -254,12 +227,9 @@ def eval_fqe_ci(algorithm,
     
     fqe_Q        = copy.deepcopy(policy)
     fqe_target_Q = copy.deepcopy(policy)
-    if algorithm == 'IQL':
-        fqe_Q.critic1.train()
-        fqe_target_Q.critic1.eval()
-    else:
-        fqe_Q.Q.train()
-        fqe_target_Q.Q.eval()
+
+    fqe_Q.Q.train()
+    fqe_target_Q.Q.eval()
 
     optimizer = torch.optim.Adam(fqe_Q.Q.parameters() if algorithm != 'IQL' else fqe_Q.critic1.parameters(), lr=lr)
     criterion = torch.nn.MSELoss()
@@ -280,15 +250,12 @@ def eval_fqe_ci(algorithm,
     dataset = FQEDataset(note, next_note, state, next_state, action, reward, done, note_bg_only, next_note_bg_only)
     loader  = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
-    # 3) FQE 학습
     for epoch in range(1, num_epochs+1):
         for n, nn, s, ns, a, r, d, note_bg_only, next_note_bg_only in loader:
-            # 온라인 Q
             # q_pred, _, _ = fqe_Q(s, n)
             q_pred = pred_q_value(algorithm, fqe_Q, s, n, note_bg_only)
             
             q_sa = q_pred.gather(1, a.unsqueeze(1)).squeeze(1)
-            # 타깃 네트워크 Q
             with torch.no_grad():
                 # q_next, _, _ = fqe_target_Q(ns, nn)
                 q_next = pred_q_value(algorithm, fqe_target_Q, ns, nn, next_note_bg_only)
@@ -300,24 +267,15 @@ def eval_fqe_ci(algorithm,
             loss.backward()
             optimizer.step()
 
-        # 타깃 네트워크 업데이트
         if epoch % target_update_freq == 0:
             if tau == 1.0:
-                if algorithm == 'IQL':
-                    fqe_target_Q.critic1.load_state_dict(fqe_Q.critic1.state_dict())
-                else:
-                    fqe_target_Q.Q.load_state_dict(fqe_Q.Q.state_dict())
+                fqe_target_Q.Q.load_state_dict(fqe_Q.Q.state_dict())
             else:
-                for p_online, p_target in zip(fqe_Q.Q.parameters() if algorithm != 'IQL' else fqe_Q.critic1.parameters(), 
-                                              fqe_target_Q.Q.parameters() if algorithm != 'IQL' else fqe_target_Q.critic1.parameters()):
+                for p_online, p_target in zip(fqe_Q.Q.parameters(), fqe_target_Q.critic1.parameters()):
                     p_target.data.mul_(1 - tau)
                     p_target.data.add_(tau * p_online.data)
 
-    # 4) 초기 상태 V0 리스트 생성
-    if algorithm == 'IQL':
-        fqe_Q.critic1.eval()
-    else:
-        fqe_Q.Q.eval()
+    fqe_Q.Q.eval()
 
     with torch.no_grad():
         
@@ -334,7 +292,6 @@ def eval_fqe_ci(algorithm,
             pi0      = F.softmax(q0, dim=1)
             v0_list.append((pi0 * q0).sum(dim=1).item())
 
-    # 5) 부트스트랩 신뢰구간
     v0_arr = np.array(v0_list, dtype=np.float64)
     fqe_mean = float(v0_arr.mean())
     M = len(v0_arr)
@@ -351,8 +308,6 @@ def eval_fqe_ci(algorithm,
     return fqe_mean, ci_lower, ci_upper
 
 
-
-
 def eval_multi_step_doubly_robust_ci(algorithm,
                                     policy,
                                     replay_buffer,
@@ -365,12 +320,9 @@ def eval_multi_step_doubly_robust_ci(algorithm,
                                 ):
 
 
-    if algorithm == 'IQL':
-        policy.actor.to(device)
-        policy.actor.eval()
-    else:
-        policy.Q.to(device)
-        policy.Q.eval()
+
+    policy.Q.to(device)
+    policy.Q.eval()
 
     N = replay_buffer.crt_size
     done_all_np = replay_buffer.done[:N].squeeze(-1)
@@ -478,15 +430,8 @@ def eval_wis_ci(algorithm,
                 n_bootstrap: int = 1000,
                 alpha: float = 0.05):
 
- 
-    if algorithm == 'IQL':
-        policy.critic1.to(device)
-        policy.critic2.to(device)
-        policy.critic1.eval()
-        policy.critic2.eval()
-    else:
-        policy.Q.to(device)
-        policy.Q.eval()
+    policy.Q.to(device)
+    policy.Q.eval()
     eps = 1e-8
 
     N = replay_buffer.crt_size
@@ -551,7 +496,6 @@ def eval_wis_ci(algorithm,
     print(f"{100*(1-alpha):.1f}% CI: [{lower:.4f}, {upper:.4f}]")
 
     return wis_mean, lower, upper
-
 
 
 def eval_opera_ci(algorithm,
@@ -626,7 +570,6 @@ def eval_opera_ci(algorithm,
     return opera_est, lower, upper, alphas
 
 
-# --------------------------------------------------
 def _compute_fqe_per_episode(algorithm, policy, replay_buffer, gamma, device):
 
     import numpy as np
@@ -634,12 +577,10 @@ def _compute_fqe_per_episode(algorithm, policy, replay_buffer, gamma, device):
 
     fqe_Q        = copy.deepcopy(policy)
     fqe_target_Q = copy.deepcopy(policy)
-    if algorithm == 'IQL':
-        fqe_Q.critic1.train();    fqe_target_Q.critic1.eval()
-        q_params = fqe_Q.critic1.parameters()
-    else:
-        fqe_Q.Q.train();          fqe_target_Q.Q.eval()
-        q_params = fqe_Q.Q.parameters()
+
+    fqe_Q.Q.train()
+    fqe_target_Q.Q.eval()
+    q_params = fqe_Q.Q.parameters()
     optimizer = torch.optim.Adam(q_params, lr=1e-3)
     criterion = torch.nn.MSELoss()
 
@@ -676,11 +617,7 @@ def _compute_fqe_per_episode(algorithm, policy, replay_buffer, gamma, device):
                             fqe_target_Q.critic1.parameters() if algorithm=='IQL' else fqe_target_Q.Q.parameters()):
             p_t.data.copy_(p_o.data)
 
-    # collect V0 per episode
-    if algorithm == 'IQL':
-        fqe_Q.critic1.eval()
-    else:
-        fqe_Q.Q.eval()
+    fqe_Q.Q.eval()
 
     v0_list = []
     with torch.no_grad():
@@ -703,10 +640,7 @@ def _compute_dr_per_episode(algorithm, policy, replay_buffer, gamma, device):
     import numpy as np
     from torch.utils.data import DataLoader
 
-    if algorithm == 'IQL':
-        policy.actor.to(device); policy.actor.eval()
-    else:
-        policy.Q.to(device); policy.Q.eval()
+    policy.Q.to(device); policy.Q.eval()
 
     N = replay_buffer.crt_size
     note      = torch.FloatTensor(replay_buffer.note[:N]).to(device)
@@ -779,41 +713,39 @@ def _compute_dr_per_episode(algorithm, policy, replay_buffer, gamma, device):
     return float(np.mean(dr_vals)), (None, None), dr_vals
 
 
-def _compute_wis_per_episode(algorithm, policy, replay_buffer, gamma, device):
+# def _compute_wis_per_episode(algorithm, policy, replay_buffer, gamma, device):
 
-    import numpy as np
+#     import numpy as np
 
-    if algorithm == 'IQL':
-        policy.critic1.to(device); policy.critic2.to(device)
-        policy.critic1.eval();   policy.critic2.eval()
-    else:
-        policy.Q.to(device);     policy.Q.eval()
 
-    N = replay_buffer.crt_size
-    note    = torch.FloatTensor(replay_buffer.note[:N]).to(device)
-    bg_note = torch.FloatTensor(replay_buffer.note_bg_only[:N]).to(device)
-    state   = torch.FloatTensor(replay_buffer.state[:N]).to(device)
-    action  = torch.LongTensor(replay_buffer.action[:N]).to(device).squeeze(-1)
-    reward  = torch.FloatTensor(replay_buffer.reward[:N]).to(device).squeeze(-1)
-    done    = torch.FloatTensor(replay_buffer.done[:N]).to(device).squeeze(-1)
-    bc_prob = torch.FloatTensor(replay_buffer.bc_prob[:N]).to(device).squeeze(-1) + 1e-8
+#     policy.Q.to(device)
+#     policy.Q.eval()
 
-    with torch.no_grad():
-        q    = pred_q_value(algorithm, policy, state, note, bg_note)
-        pi   = F.softmax(q, dim=1)
-        pi_a = pi.gather(1, action.unsqueeze(1)).squeeze(1)
-        rho  = torch.clamp(pi_a / bc_prob, max=5.0)
+#     N = replay_buffer.crt_size
+#     note    = torch.FloatTensor(replay_buffer.note[:N]).to(device)
+#     bg_note = torch.FloatTensor(replay_buffer.note_bg_only[:N]).to(device)
+#     state   = torch.FloatTensor(replay_buffer.state[:N]).to(device)
+#     action  = torch.LongTensor(replay_buffer.action[:N]).to(device).squeeze(-1)
+#     reward  = torch.FloatTensor(replay_buffer.reward[:N]).to(device).squeeze(-1)
+#     done    = torch.FloatTensor(replay_buffer.done[:N]).to(device).squeeze(-1)
+#     bc_prob = torch.FloatTensor(replay_buffer.bc_prob[:N]).to(device).squeeze(-1) + 1e-8
 
-    end_idxs   = torch.nonzero(done, as_tuple=True)[0]
-    start_idxs = torch.cat([torch.tensor([0], device=device),
-                            end_idxs[:-1]+1])
+#     with torch.no_grad():
+#         q    = pred_q_value(algorithm, policy, state, note, bg_note)
+#         pi   = F.softmax(q, dim=1)
+#         pi_a = pi.gather(1, action.unsqueeze(1)).squeeze(1)
+#         rho  = torch.clamp(pi_a / bc_prob, max=5.0)
 
-    weighted_returns = []
-    for st, en in zip(start_idxs.tolist(), end_idxs.tolist()):
-        rho_i = float(torch.prod(rho[st:en+1]).cpu().item())
-        G_i   = sum((gamma**k) * float(reward[st+k].cpu().item())
-                    for k in range(en-st+1))
-        weighted_returns.append(rho_i * G_i)
+#     end_idxs   = torch.nonzero(done, as_tuple=True)[0]
+#     start_idxs = torch.cat([torch.tensor([0], device=device),
+#                             end_idxs[:-1]+1])
 
-    wis_mean = float(np.mean(weighted_returns))
-    return wis_mean, weighted_returns, (None, None)
+#     weighted_returns = []
+#     for st, en in zip(start_idxs.tolist(), end_idxs.tolist()):
+#         rho_i = float(torch.prod(rho[st:en+1]).cpu().item())
+#         G_i   = sum((gamma**k) * float(reward[st+k].cpu().item())
+#                     for k in range(en-st+1))
+#         weighted_returns.append(rho_i * G_i)
+
+#     wis_mean = float(np.mean(weighted_returns))
+#     return wis_mean, weighted_returns, (None, None)

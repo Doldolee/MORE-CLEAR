@@ -1,7 +1,7 @@
 import mlflow
 from configs.config import get_params
 from buffer import ReplayBuffer
-from agent import MultimodalContextCQL
+from agent import MultimodalContextCQL, TextCQL, TabularCQL
 from metric import eval_multi_step_doubly_robust_ci, eval_wis_ci, eval_fqe_ci, eval_policy_survival_rate, eval_opera_ci, collect_bellman_residuals
 from util import set_seed
 import numpy as np
@@ -46,7 +46,7 @@ def train(params):
                                 note_form=params['note_form']
                                 ).load_original_dataset(only_test_set=True)
     ###########################################################################################
-    val_datasets = ['mimic3', 'mimic4']
+    val_datasets = ['mimic3', 'mimic4', 'pd']
     val_datasets.remove(params['target_data'])
 
     val_buffer1 = ReplayBuffer(state_dim=params['state_dim'],
@@ -66,9 +66,9 @@ def train(params):
                                ).load_validation_dataset(ori_data = params['target_data'])
 
     ################################################################################
-
     policy = MultimodalContextCQL(**params)
-
+    # policy = TextCQL(**params)
+    # policy = TabularCQL(**params)
     ################################################################################
 
     training_iters = 0
@@ -82,7 +82,6 @@ def train(params):
             
         training_iters += 1
         # print(training_iters)
-
 
     # bellman_residuals = collect_bellman_residuals(params['algorithm'], policy, test_buffer)
     # np.save(f"./residuals_{params['algorithm']}", bellman_residuals)

@@ -76,7 +76,7 @@ class CQLContextGatedFusionMixerNet(nn.Module):
         num_actions: int,
         hidden_node: int,
         activation: str = 'relu',
-        note_emb_dim: int = 768,
+        note_emb_dim: int = 768, # or 4096
     ):
         super().__init__()
         self.note_proj1 = nn.Linear(note_emb_dim, hidden_node)
@@ -156,5 +156,120 @@ class CQLContextGatedFusionMixerNet(nn.Module):
         x = self.act(self.share_bn(self.share_fc(combined)))
         v = self.value_fc2(self.act(self.value_bn(self.value_fc1(x))))
         a = self.adv_fc2(self.act(self.adv_bn(self.adv_fc1(x))))
+        q = v + (a - a.mean(dim=1, keepdim=True))
+        return q
+
+
+class BertNetCQL(nn.Module):
+    def __init__(
+        self,
+        num_actions: int,
+        hidden_node: int,
+        activation: str = 'relu',
+        note_emb_dim: int = 768
+    ):
+        super(BertNetCQL, self).__init__()
+        # Note embedding projection
+        self.note_proj1 = nn.Linear(note_emb_dim, hidden_node)
+        self.note_bn1   = nn.BatchNorm1d(hidden_node)
+        self.note_proj2 = nn.Linear(hidden_node, hidden_node)
+        self.note_bn2   = nn.BatchNorm1d(hidden_node)
+
+        # Shared feature branch
+        self.share_q    = nn.Linear(hidden_node, hidden_node)
+        self.share_bn   = nn.BatchNorm1d(hidden_node)
+
+        # Dueling: Value branch
+        self.value_q1   = nn.Linear(hidden_node, hidden_node)
+        self.value_bn1  = nn.BatchNorm1d(hidden_node)
+        self.value_q2   = nn.Linear(hidden_node, 1)
+        self.value_bn2  = nn.BatchNorm1d(1)
+
+        # Dueling: Advantage branch
+        self.adv_q1     = nn.Linear(hidden_node, hidden_node)
+        self.adv_bn1    = nn.BatchNorm1d(hidden_node)
+        self.adv_q2     = nn.Linear(hidden_node, num_actions)
+        self.adv_bn2    = nn.BatchNorm1d(num_actions)
+
+        # Activation
+        if activation.lower() == 'relu':
+            self.act = F.relu
+        elif activation.lower() == 'tanh':
+            self.act = torch.tanh
+        else:
+            raise ValueError(f"Unsupported activation: {activation}")
+
+    def forward(self, note_emb: torch.Tensor) -> torch.Tensor:
+        # embedding projection
+        x = self.act(self.note_bn1(self.note_proj1(note_emb)))
+        x = self.act(self.note_bn2(self.note_proj2(x)))
+
+        # shared features
+        x = self.act(self.share_bn(self.share_q(x)))
+
+        # value stream
+        v = self.act(self.value_bn1(self.value_q1(x)))
+        v = self.act(self.value_bn2(self.value_q2(v)))  # [B,1]
+
+        # advantage stream
+        adv = self.act(self.adv_bn1(self.adv_q1(x)))
+        adv = self.act(self.adv_bn2(self.adv_q2(adv))) # [B,A]
+
+        # dueling combine
+        adv_mean = adv.mean(dim=1, keepdim=True)       # [B,1]
+        q = v + adv - adv_mean                         # [B,A]
+        return q
+
+
+
+class CQLNet(torch.nn.Module):
+    def __init__(self, state_dim, num_actions, hidden_node, activation='relu'):
+        super(CQLNet, self).__init__()
+        # Shared layers
+        self.fc1 = torch.nn.Linear(state_dim, hidden_node)
+        self.bn1 = torch.nn.BatchNorm1d(hidden_node)
+        self.fc2 = torch.nn.Linear(hidden_node, hidden_node)
+        self.bn2 = torch.nn.BatchNorm1d(hidden_node)
+
+        # Value stream
+        self.value_fc = torch.nn.Linear(hidden_node, hidden_node)
+        self.value_bn = torch.nn.BatchNorm1d(hidden_node)
+        self.value_out = torch.nn.Linear(hidden_node, 1)
+
+        # Advantage stream
+        self.adv_fc = torch.nn.Linear(hidden_node, hidden_node)
+        self.adv_bn = torch.nn.BatchNorm1d(hidden_node)
+        self.adv_out = torch.nn.Linear(hidden_node, num_actions)
+
+        # Activation
+        if activation.lower() == 'relu':
+            self.act = F.relu
+        elif activation.lower() == 'tanh':
+            self.act = torch.tanh
+        else:
+            raise ValueError("Unsupported activation")
+
+    def forward(self, state):
+        # Shared
+        x = self.fc1(state)
+        x = self.bn1(x)
+        x = self.act(x)
+        x = self.fc2(x)
+        x = self.bn2(x)
+        x = self.act(x)
+
+        # Value
+        v = self.value_fc(x)
+        v = self.value_bn(v)
+        v = self.act(v)
+        v = self.value_out(v)
+
+        # Advantage
+        a = self.adv_fc(x)
+        a = self.adv_bn(a)
+        a = self.act(a)
+        a = self.adv_out(a)
+
+        # Combine streams
         q = v + (a - a.mean(dim=1, keepdim=True))
         return q

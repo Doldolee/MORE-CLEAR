@@ -18,7 +18,6 @@ class CustomDatasetForMortality(Dataset):
         return len(self.note)
 
     def __getitem__(self, index):
-        # 문자열은 그대로, 나머지는 tensor의 해당 인덱스를 반환
         note = self.note[index]
         state = self.state[index]
         action = self.action[index]
@@ -28,9 +27,7 @@ class CustomDatasetForMortality(Dataset):
         return note, state, action, reward, done
 
 def custom_collate_fn_for_mortality(batch):
-    # batch는 각 항목이 (note, dem, state, action, length, time, reward) 형태의 튜플들로 구성됨
     note, state, action, reward, done = zip(*batch)
-    # 문자열은 리스트 형태로 유지하고, 나머지 숫자형 데이터는 텐서로 묶음
     batch_notes = torch.stack(note)
     batch_states = torch.stack(state)
     batch_action = torch.stack(action)

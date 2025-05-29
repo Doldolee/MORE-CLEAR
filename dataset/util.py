@@ -6,7 +6,6 @@ from collections import deque
 from tqdm import tqdm
 from typing import List, Union
 
-## only extracts background
 def extract_background_next_notes(next_notes, notes, done, missing='no clinical note'):
 
     backgrounds = []
@@ -25,14 +24,7 @@ def extract_background_next_notes(next_notes, notes, done, missing='no clinical 
 
     return backgrounds
     
-# only extracts background
 def extract_background_states(notes, done, missing='no clinical note'):
-    """
-    notes: list of str
-    done: list of bool/int, True at episode boundaries
-    missing: placeholder for missing notes
-    returns: list of str, each entry is either "[context] first_valid_note" or the missing placeholder
-    """
     backgrounds = []
     first_valid = None
 
@@ -52,16 +44,12 @@ def extract_background_states(notes, done, missing='no clinical note'):
 
     return backgrounds
 
-## background + window 3 stack
 def bg_stack_next_note(
     next_notes: List[str],
     done: List[Union[bool, int]],
     sep: str = ' | ',
     missing: str = 'no clinical note'
 ) -> List[str]:
-    """
-    Episode-aware stacking for next_notes, including only t-1 and t-2 within the same episode.
-    """
     stacked = []
     first_valid = None
     last_reset = -1
@@ -70,12 +58,10 @@ def bg_stack_next_note(
         flag = bool(flag)
         is_first = False
 
-        # Detect first valid note in episode
         if first_valid is None and nxt != missing:
             first_valid = nxt
             is_first = True
 
-        # Collect t-2, t-1 valid notes within current episode
         suffix = []
         for idx in (i-2, i-1):
             if idx > last_reset and 0 <= idx < len(next_notes):
@@ -83,7 +69,6 @@ def bg_stack_next_note(
                 if prev != missing and prev != first_valid and prev not in suffix:
                     suffix.append(prev)
 
-        # Build output
         if first_valid is None:
             out = nxt
         else:
@@ -100,7 +85,6 @@ def bg_stack_next_note(
 
         stacked.append(out)
 
-        # Reset at episode boundary
         if flag:
             first_valid = None
             last_reset = i
@@ -155,7 +139,6 @@ def bg_stack_note(notes: List[str],
     
     return stacked
     
-## background
 def impute_next_notes_with_background(next_notes, notes, done, missing='no clinical note'):
 
     imputed = []
@@ -185,7 +168,6 @@ def impute_next_notes_with_background(next_notes, notes, done, missing='no clini
 
     return imputed
 
-## background
 def impute_notes_with_background(notes, done, missing='no clinical note'):
 
     imputed = []
@@ -210,14 +192,7 @@ def impute_notes_with_background(notes, done, missing='no clinical note'):
 
     return imputed
     
-## simple impute
 def impute_notes(notes, done, missing='no clinical note'):
-    """
-    notes: list of str
-    done: list of bool/int, True at episode boundaries
-    missing: 결측을 나타내는 문자열
-    returns: imputed list of str
-    """
     imputed = []
     last_valid = None
 
@@ -233,19 +208,8 @@ def impute_notes(notes, done, missing='no clinical note'):
 
     return imputed
 
-## simple impute
 def impute_next_notes(next_notes, notes, done, missing='no clinical note'):
-    """
-    next_notes: list of str, aligned with `done`, where next_notes[i] is the note at the next time step
-    notes:      list of str, aligned one step behind next_notes (so notes[i] is the “current” note for next_notes[i])
-    done:       list of bool/int, True (or 1) at the end of each episode, aligned with next_notes
-    missing:    the placeholder string indicating a missing clinical note
 
-    Returns a new list where each missing next_note is imputed by:
-      1) the current note at the same index, if available
-      2) else the most recent valid imputed note within the same episode
-      3) else left as missing (if no valid note seen yet)
-    """
     imputed = []
     last_valid = None
 
@@ -281,7 +245,6 @@ def stack_notes(notes, done, window=3, sep=' | ', missing='no clinical note'):
 
     return stacked
 
-    
 def stack_next_notes(next_notes, notes, done, window=3, sep=' | ', missing='no clinical note'):
 
     stacked = []
