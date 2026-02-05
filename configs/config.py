@@ -5,18 +5,19 @@ import yaml
 
 
 def get_params():
-  note_emb_dim = [768]   # 4096, 768
-  note_form = ['']                 #['', '_impute', '_stack'] 
-  embedding_model = ['clinical_bert']
-  target_data = ["mimic3"]               
-  algorithm = ["ClinicalBert_CQL_Cross_Context_Attention"]                                      
-                                          # [BCQ, CQL]     $IQL                                            
-                                          # [ClinicalBert]
-                                          # [ClinicalBert_CQL_Cross_Context_Attention]
+  note_emb_dim = [4096]   # 4096, 768
+  note_form = ['']               
+  embedding_model = ['llama'] 
+              # [bert, clinical_bert]
+              # [llama]
+
+  target_data = ["mimic4"]                # ["mimic3", "mimic4", "snuh"]
+  algorithm = ["CQL_Cross_Context_Attention"]                                      
+ 
   bcq_threshold = [0.3] # [0.2, 0.3]                       
   discount = [0.98] # 0.99, 0.98                           
   optimizer = ['Adam']
-  optimizer_parameters = [{"lr":0.0001, 'weight_decay':0.01}] # {"lr":0.0003}, {"lr":0.001}        
+  optimizer_parameters = [{"lr":0.00001, 'weight_decay':0.01}] # {"lr":0.0003}, {"lr":0.001}        
   use_polyak_target_update = [False] # [False, True] 
   target_update_frequency = [10] # [10, 50,100]
   tau = [0.005] # [0.005, 0.1]
@@ -24,12 +25,10 @@ def get_params():
   eval_freq = [10] 
   tol = [2]
   rho_clip = [1]
-  hidden_node = [512] # 512 or 1024
+  hidden_node = [1024] # tabular : 1024
   activation = ["relu"] # ["relu", "tanh"]
-  batch_size = [256]
+  batch_size = [128]
   
-
- 
   param_array = list(itertools.product(bcq_threshold, 
                                       discount, 
                                       optimizer, 

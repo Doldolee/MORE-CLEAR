@@ -1,10 +1,12 @@
-from network import BertNetCQL, CQLNet, CQLContextGatedFusionMixerNet
-
+from network import TextNetCQL, CQLNet, CQLContextGatedFusionMixerNet
 import copy
 import torch
 import torch.nn.functional as F
 from abc import ABC, abstractmethod
 import math
+import os
+import numpy as np
+import matplotlib.pyplot as plt
 
 
 class BaseQ(ABC):
@@ -31,7 +33,6 @@ class BaseQ(ABC):
         self.target_data = target_data
         self.state_dim = state_dim
         self.note_emb_dim = kwargs.get("note_emb_dim")
-
         self.maybe_update_target = self.polyak_target_update if use_polyak_target_update else self.copy_target_update
 
         
@@ -41,7 +42,6 @@ class BaseQ(ABC):
 
     @abstractmethod
     def action(self, state):
-
         pass
 
     @abstractmethod
@@ -70,9 +70,10 @@ class MultimodalContextCQL(BaseQ):
         tau=0.005,
         hidden_node=128,
         activation='relu',
-        cql_alpha=2.0,
+        cql_alpha=1.0,
         **kwargs
     ):
+
         self.cql_alpha = cql_alpha
         super(MultimodalContextCQL, self).__init__(
             num_actions,
@@ -95,6 +96,7 @@ class MultimodalContextCQL(BaseQ):
         self.max_training_steps = kwargs.get("max_timesteps")
         self.warmup_steps = int(0.1 * self.max_training_steps)
         self.training_step_count = 0
+
 
         self.decay_steps = kwargs.get("decay_steps", int(0.2 * self.max_training_steps))
         self.decay_gamma = kwargs.get("decay_gamma", 0.8)
@@ -125,7 +127,8 @@ class MultimodalContextCQL(BaseQ):
             q = self.Q(
                 state.to(self.device),
                 note_emb.to(self.device),
-                context_emb.to(self.device)
+                context_emb.to(self.device),
+                return_attn=False
             )
             return int(q.argmax(dim=1))
 
@@ -135,18 +138,20 @@ class MultimodalContextCQL(BaseQ):
         note_emb, next_note_emb, state, action, next_state, reward, done, _, context_emb, next_context_emb = replay_buffer.sample()
 
         with torch.no_grad():
-            q_next = self.Q_target(
+            q_next, aux_target = self.Q_target(
                 next_state.to(self.device),
                 next_note_emb.to(self.device),
-                next_context_emb.to(self.device)
+                next_context_emb.to(self.device),
+                return_attn=True
             )
             next_act = q_next.argmax(dim=1, keepdim=True)
             target_q = reward + (1 - done) * self.discount * q_next.gather(1, next_act)
 
-        q_pred = self.Q(
+        q_pred, aux_current = self.Q(
             state.to(self.device),
             note_emb.to(self.device),
-            context_emb.to(self.device)
+            context_emb.to(self.device),
+            return_attn=True
         )
         current_q = q_pred.gather(1, action)
         td_loss = F.mse_loss(current_q, target_q)
@@ -154,19 +159,19 @@ class MultimodalContextCQL(BaseQ):
         lse = torch.logsumexp(q_pred / alpha, dim=1, keepdim=True) * alpha
         data_q = current_q.mean()
         cql_loss = lse.mean() - data_q
-        loss = td_loss + cql_loss
 
+        loss = td_loss + cql_loss
         self.Q_optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self.Q.parameters(), max_norm=1.0)
         self.Q_optimizer.step()
-
         self.lr_scheduler.step()
-
 
         self.iterations += 1
         if self.iterations % self.target_update_frequency == 0:
             self.maybe_update_target()
+    
+
 
 
 class TextCQL(BaseQ):
@@ -183,23 +188,17 @@ class TextCQL(BaseQ):
         tau: float = 0.005,
         hidden_node: int = 256,
         activation: str = 'relu',
-        cql_alpha: float = 2.0,
+        alpha: float = 1.0,
         **kwargs
     ):
-        self.cql_alpha = cql_alpha
-        super(TextCQL, self).__init__(num_actions, 
-                                      state_dim, device,
-                                      discount,
-                                      optimizer,
-                                      optimizer_parameters,
-                                      use_polyak_target_update,
-                                      target_update_frequency,
-                                      tau, 
-                                      hidden_node, 
-                                      activation, 
-                                      **kwargs
-                                )
-        
+        super(TextCQL, self).__init__(
+            num_actions, state_dim, device,
+            discount, optimizer, optimizer_parameters,
+            use_polyak_target_update, target_update_frequency,
+            tau, hidden_node, activation, **kwargs
+        )
+        self.alpha = alpha
+
         self.Q = self.build_network(num_actions, hidden_node, activation).to(self.device)
         self.Q_target = copy.deepcopy(self.Q)
         self.optimizer = getattr(torch.optim, optimizer)(self.Q.parameters(), **optimizer_parameters)
@@ -214,7 +213,7 @@ class TextCQL(BaseQ):
         self.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda=lr_lambda)
 
     def build_network(self, num_actions: int, hidden_node: int, activation: str):
-        return BertNetCQL(num_actions, hidden_node, activation, note_emb_dim=self.note_emb_dim)
+        return TextNetCQL(num_actions, hidden_node, activation, note_emb_dim=self.note_emb_dim)
 
     def action(self, note_emb: torch.Tensor) -> int:
         with torch.no_grad():
@@ -239,8 +238,6 @@ class TextCQL(BaseQ):
         cql_penalty = (lse_q - data_q).mean() * self.alpha
 
         loss = bellman_loss + cql_penalty
-
-        # optimize + lr step
         self.optimizer.zero_grad()
         loss.backward()
         self.optimizer.step()
@@ -264,7 +261,7 @@ class TabularCQL(BaseQ):
                  tau=0.005,
                  hidden_node=128,
                  activation='relu',
-                 cql_alpha=2.0,
+                 cql_alpha=1.0,
                  **kwargs):
         self.cql_alpha = cql_alpha
         super(TabularCQL, self).__init__(num_actions,
@@ -295,7 +292,7 @@ class TabularCQL(BaseQ):
         self.Q.train()
         _, _, state, action, next_state, reward, done, _, _, _ = replay_buffer.sample()
 
-        # Target Q
+        # Target Q (DQN style)
         with torch.no_grad():
             q_next = self.Q_target(next_state)
             next_act = q_next.argmax(dim=1, keepdim=True)
@@ -307,6 +304,10 @@ class TabularCQL(BaseQ):
 
         # TD loss
         td_loss = F.mse_loss(current_q, target_q)
+
+        # Bellman error print
+        # bellman_error = (target_q - current_q).abs().mean().item()
+        # print(f"Bellman error: {bellman_error:.6f}")
 
         # CQL conservative loss
         alpha = self.cql_alpha

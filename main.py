@@ -5,6 +5,48 @@ from agent import MultimodalContextCQL, TextCQL, TabularCQL
 from metric import eval_multi_step_doubly_robust_ci, eval_wis_ci, eval_fqe_ci, eval_policy_survival_rate, eval_opera_ci, collect_bellman_residuals
 from util import set_seed
 import numpy as np
+import torch
+import os
+
+def _sanitize(s: str) -> str:
+    return str(s).replace("%", "pct").replace("/", "_").replace(" ", "")
+
+def save_checkpoint(policy, params, train_f, training_iters, save_dir="./pth"):
+    os.makedirs(save_dir, exist_ok=True)
+
+    fname = (
+        f"{_sanitize(params['target_data'])}_"
+        f"{_sanitize(params['embedding_model'])}_"
+        f"{_sanitize(params['algorithm'])}_"
+        f"{_sanitize(params.get('note_form',''))}_"
+        f"train{_sanitize(train_f)}_"
+        f"seed{_sanitize(params.get('seed',0))}.pt"
+    )
+    save_path = os.path.join(save_dir, fname)
+
+    params_to_save = dict(params)
+    if "device" in params_to_save:
+        params_to_save["device"] = str(params_to_save["device"])
+
+    ckpt = {
+        "params": params_to_save,
+        "train_frac": train_f,
+        "training_iters": training_iters,
+        "policy_state": {
+            "Q": policy.Q.state_dict() if hasattr(policy, "Q") else None,
+            "Q_target": policy.Q_target.state_dict() if hasattr(policy, "Q_target") else None,
+            "Q_optimizer": policy.Q_optimizer.state_dict() if hasattr(policy, "Q_optimizer") else None,
+            "optimizer": policy.optimizer.state_dict() if hasattr(policy, "optimizer") else None,
+            "lr_scheduler": policy.lr_scheduler.state_dict() if hasattr(policy, "lr_scheduler") else None,
+            "iterations": getattr(policy, "iterations", None),
+            "threshold": getattr(policy, "threshold", None),
+        }
+    }
+
+    torch.save(ckpt, save_path)
+    print(f"[Checkpoint Saved] {save_path}")
+
+    return save_path
 
 def log_params(params):
 
@@ -82,7 +124,7 @@ def train(params):
             
         training_iters += 1
         # print(training_iters)
-
+    # save_checkpoint(policy, params, train_f=train_f, training_iters=training_iters, save_dir="./pth")
     # bellman_residuals = collect_bellman_residuals(params['algorithm'], policy, test_buffer)
     # np.save(f"./residuals_{params['algorithm']}", bellman_residuals)
 

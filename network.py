@@ -1,166 +1,257 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import math
+import numpy as np
 
 
-class TabMixerBlock(nn.Module):
-    def __init__(self, num_features: int, dim: int, num_heads: int, mlp_ratio: float = 4.0, dropout: float = 0.1):
+class FeatureMixerBlock(nn.Module):
+    """
+    MLP-Mixer style feature-mixing block for hidden-dimension state data.
+    Only mixes across feature dimension to avoid batch-size dependence.
+    Outputs maintain hidden_dim size.
+    """
+    def __init__(self, hidden_dim):
         super().__init__()
-        self.norm1 = nn.LayerNorm(dim)
-        self.attn = nn.MultiheadAttention(embed_dim=dim, num_heads=num_heads, dropout=dropout, batch_first=True)
-        hidden_dim = int(dim * mlp_ratio)
-        self.norm2 = nn.LayerNorm(dim)
-        self.mlp = nn.Sequential(
-            nn.Linear(dim, hidden_dim),
+        # feature-mixing across feature dimension
+        self.feature_mlp = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
             nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, dim),
-            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim)
         )
+        self.norm = nn.LayerNorm(hidden_dim)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x):
+        # x: [batch, hidden_dim]
         residual = x
-        x_norm = self.norm1(x)
-        attn_out, _ = self.attn(x_norm, x_norm, x_norm)
-        x = residual + attn_out
-
-        residual2 = x
-        x_norm2 = self.norm2(x)
-        mlp_out = self.mlp(x_norm2)
-        x = residual2 + mlp_out
+        v = self.feature_mlp(x)
+        x = residual + v
+        x = self.norm(x)
         return x
-
-class TabMixer(nn.Module):
-    def __init__(
-        self,
-        num_features: int,
-        dim: int = 64,
-        depth: int = 6,
-        num_heads: int = 4,
-        mlp_ratio: float = 4.0,
-        dropout: float = 0.1,
-        num_classes: int = 1,
-    ):
-        super().__init__()
-        self.feature_embed = nn.Linear(1, dim)
-        self.dropout = nn.Dropout(dropout)
-        self.blocks = nn.ModuleList([
-            TabMixerBlock(num_features=num_features, dim=dim, num_heads=num_heads, mlp_ratio=mlp_ratio, dropout=dropout)
-            for _ in range(depth)
-        ])
-        self.norm = nn.LayerNorm(dim)
-        self.head = nn.Sequential(
-            nn.Linear(num_features * dim, dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(dim, num_classes)
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        batch_size, num_features = x.size()
-        x = x.unsqueeze(-1)               # (B, F, 1)
-        x = self.feature_embed(x)         # (B, F, dim)
-        x = self.dropout(x)
-        for blk in self.blocks:
-            x = blk(x)
-        x = self.norm(x)                  # (B, F, dim)
-        x = x.reshape(batch_size, -1)     # (B, F*dim)
-        out = self.head(x)                # (B, num_classes==dim)
-        return out                        # → (B, hidden_node)
-
+    
 
 class CQLContextGatedFusionMixerNet(nn.Module):
+
     def __init__(
         self,
         state_dim: int,
         num_actions: int,
         hidden_node: int,
-        activation: str = 'relu',
-        note_emb_dim: int = 768, # or 4096
+        activation: str = "relu",
+        note_emb_dim: int = 768,
+        num_heads: int = 4,
+        init_q_scale: float = 0.02,
+        attn_entropy_coef: float = 0.0,   # NEW: entropy penalty coefficient (>=0)
+        entropy_eps: float = 1e-8,        # NEW: log 안정화
     ):
         super().__init__()
+
+        # -----------------------------
+        # Note projection
+        # -----------------------------
         self.note_proj1 = nn.Linear(note_emb_dim, hidden_node)
         self.note_bn1   = nn.BatchNorm1d(hidden_node)
         self.note_proj2 = nn.Linear(hidden_node, hidden_node)
         self.note_bn2   = nn.BatchNorm1d(hidden_node)
+
+        # -----------------------------
+        # Context projection
+        # -----------------------------
         self.ctx_proj1  = nn.Linear(note_emb_dim, hidden_node)
         self.ctx_bn1    = nn.BatchNorm1d(hidden_node)
         self.ctx_proj2  = nn.Linear(hidden_node, hidden_node)
         self.ctx_bn2    = nn.BatchNorm1d(hidden_node)
 
+        # -----------------------------
+        # State projection + mixers
+        # -----------------------------
+        self.state_proj = nn.Linear(state_dim, hidden_node)
+        self.state_bn0  = nn.BatchNorm1d(hidden_node)
+        self.state_mixer1 = FeatureMixerBlock(hidden_dim=hidden_node)
+        self.state_mixer2 = FeatureMixerBlock(hidden_dim=hidden_node)
 
-        self.state_encoder = TabMixer(
-            num_features=state_dim,
-            dim=hidden_node,
-            depth=4,         
-            num_heads=4,
-            mlp_ratio=4.0,
-            dropout=0.1,
-            num_classes=hidden_node
-        )
-
-        # Gated fusion
+        # -----------------------------
+        # Gated fusion (note vs context)
+        # -----------------------------
         self.gate = nn.Linear(hidden_node * 2, hidden_node)
-        # Bidirectional cross-attention
-        self.cross_attn_st2tx = nn.MultiheadAttention(embed_dim=hidden_node, num_heads=4)
-        self.cross_attn_tx2st = nn.MultiheadAttention(embed_dim=hidden_node, num_heads=4)
 
-        # Combine & dueling
+        # -----------------------------
+        # 2-token attention
+        # -----------------------------
+        self.attn_state_query = nn.MultiheadAttention(embed_dim=hidden_node, num_heads=num_heads)
+        self.attn_text_query  = nn.MultiheadAttention(embed_dim=hidden_node, num_heads=num_heads)
+
+        # learnable router queries
+        self.q_state_tok = nn.Parameter(torch.randn(1, 1, hidden_node) * init_q_scale)
+        self.q_text_tok  = nn.Parameter(torch.randn(1, 1, hidden_node) * init_q_scale)
+
+        # -----------------------------
+        # Combine -> shared -> dueling
+        # -----------------------------
         self.combined_dim = hidden_node * 4
-        self.share_fc   = nn.Linear(self.combined_dim, hidden_node)
-        self.share_bn   = nn.BatchNorm1d(hidden_node)
+        self.share_fc = nn.Linear(self.combined_dim, hidden_node)
+        self.share_bn = nn.BatchNorm1d(hidden_node)
+
         self.value_fc1 = nn.Linear(hidden_node, hidden_node)
         self.value_bn  = nn.BatchNorm1d(hidden_node)
         self.value_fc2 = nn.Linear(hidden_node, 1)
-        self.adv_fc1   = nn.Linear(hidden_node, hidden_node)
-        self.adv_bn    = nn.BatchNorm1d(hidden_node)
-        self.adv_fc2   = nn.Linear(hidden_node, num_actions)
 
-        if activation.lower() == 'relu':
+        self.adv_fc1 = nn.Linear(hidden_node, hidden_node)
+        self.adv_bn  = nn.BatchNorm1d(hidden_node)
+        self.adv_fc2 = nn.Linear(hidden_node, num_actions)
+
+        # -----------------------------
+        # Activation
+        # -----------------------------
+        if activation.lower() == "relu":
             self.act = F.relu
-        elif activation.lower() == 'tanh':
+        elif activation.lower() == "tanh":
             self.act = torch.tanh
         else:
             raise ValueError(f"Unsupported activation: {activation}")
 
-    def forward(self, state: torch.Tensor, note_emb: torch.Tensor, context_emb: torch.Tensor):
+        # -----------------------------
+        # NEW: entropy penalty configs
+        # -----------------------------
+        self.attn_entropy_coef = float(attn_entropy_coef)
+        self.entropy_eps = float(entropy_eps)
+
+    def _attn_entropy_from_weights(self, w: torch.Tensor) -> torch.Tensor:
+        """
+        w: (B, heads, 1, 2)  (average_attn_weights=False)
+        return: scalar entropy (mean over B and heads)
+        """
+        # (B, heads, 2)
+        p = w.squeeze(2)
+        # entropy over last dim (2-token distribution)
+        ent = -(p * (p + self.entropy_eps).log()).sum(dim=-1)  # (B, heads)
+        return ent.mean()  # scalar
+
+    def forward(
+        self,
+        state: torch.Tensor,
+        note_emb: torch.Tensor,
+        context_emb: torch.Tensor,
+        return_attn: bool = False,
+    ):
+        # -----------------------------
+        # Project note & context
+        # -----------------------------
         x_note = self.act(self.note_bn1(self.note_proj1(note_emb)))
         x_note = self.act(self.note_bn2(self.note_proj2(x_note)))
+
         x_ctx  = self.act(self.ctx_bn1(self.ctx_proj1(context_emb)))
         x_ctx  = self.act(self.ctx_bn2(self.ctx_proj2(x_ctx)))
 
-        # State → TabMixer
-        x_state = self.state_encoder(state)  # (B, hidden_node)
+        # -----------------------------
+        # Project state and apply feature mixers
+        # -----------------------------
+        x_state = self.act(self.state_bn0(self.state_proj(state)))
+        x_state = self.state_mixer1(x_state)
+        x_state = self.state_mixer2(x_state)
 
+        # -----------------------------
         # Gated fusion
-        gate_in    = torch.cat([x_note, x_ctx], dim=1)
-        gate_score = torch.sigmoid(self.gate(gate_in))
-        fused_text = gate_score * x_note + (1 - gate_score) * x_ctx
+        # -----------------------------
+        gate_in    = torch.cat([x_note, x_ctx], dim=1)          # (B, 2H)
+        gate       = torch.sigmoid(self.gate(gate_in))          # (B, H)
+        fused_text = gate * x_note + (1.0 - gate) * x_ctx       # (B, H)
 
-        # Cross-modal attention
-        attn_st, _ = self.cross_attn_st2tx(
-            x_state.unsqueeze(0), fused_text.unsqueeze(0), fused_text.unsqueeze(0)
+        # KV = [state, text]
+        kv = torch.stack([x_state, fused_text], dim=0)          # (2, B, H)
+        B  = x_state.size(0)
+
+        # Q = learnable tokens
+        q_state = self.q_state_tok.expand(1, B, -1)             # (1, B, H)
+        q_text  = self.q_text_tok.expand(1, B, -1)              # (1, B, H)
+
+        # (1) state-router query
+        out_s, w_s = self.attn_state_query(
+            q_state, kv, kv,
+            need_weights=True,
+            average_attn_weights=False,
         )
-        attn_st = attn_st.squeeze(0)
-        attn_tx, _ = self.cross_attn_tx2st(
-            fused_text.unsqueeze(0), x_state.unsqueeze(0), x_state.unsqueeze(0)
+        out_s = out_s.squeeze(0)                                # (B, H)
+
+        # (2) text-router query
+        out_t, w_t = self.attn_text_query(
+            q_text, kv, kv,
+            need_weights=True,
+            average_attn_weights=False,
         )
-        attn_tx = attn_tx.squeeze(0)
+        out_t = out_t.squeeze(0)                                # (B, H)
 
-        # residual+attn → concat
-        state_feat = torch.cat([x_state, attn_tx], dim=1)
-        text_feat  = torch.cat([fused_text, attn_st], dim=1)
-        combined   = torch.cat([state_feat, text_feat], dim=1)
+        # head mean -> (B,2)
+        w_s_mean = w_s.mean(dim=1).squeeze(1)                   # (B,2)
+        w_t_mean = w_t.mean(dim=1).squeeze(1)                   # (B,2)
 
-        # downstream
+        attn_s_to_state = w_s_mean[:, 0]
+        attn_s_to_text  = w_s_mean[:, 1]
+        attn_t_to_state = w_t_mean[:, 0]
+        attn_t_to_text  = w_t_mean[:, 1]
+
+        # -----------------------------
+        # NEW: entropy penalty (low entropy => more decisive)
+        # -----------------------------
+        # raw entropies (scalar)
+        ent_s = self._attn_entropy_from_weights(w_s)  # scalar
+        ent_t = self._attn_entropy_from_weights(w_t)  # scalar
+        attn_entropy = 0.5 * (ent_s + ent_t)          # scalar
+        attn_entropy_penalty = self.attn_entropy_coef * attn_entropy  # scalar
+
+        # -----------------------------
+        # Build embedding
+        # -----------------------------
+        emb_state = torch.cat([x_state, out_s], dim=1)          # (B, 2H)
+        emb_text  = torch.cat([fused_text, out_t], dim=1)       # (B, 2H)
+        combined  = torch.cat([emb_state, emb_text], dim=1)     # (B, 4H)
+
         x = self.act(self.share_bn(self.share_fc(combined)))
-        v = self.value_fc2(self.act(self.value_bn(self.value_fc1(x))))
-        a = self.adv_fc2(self.act(self.adv_bn(self.adv_fc1(x))))
+
+        # -----------------------------
+        # Dueling
+        # -----------------------------
+        v = self.act(self.value_bn(self.value_fc1(x)))
+        v = self.value_fc2(v)
+
+        a = self.act(self.adv_bn(self.adv_fc1(x)))
+        a = self.adv_fc2(a)
+
         q = v + (a - a.mean(dim=1, keepdim=True))
+
+        if return_attn:
+            aux = {
+                # gate
+                "gate_mean": gate.mean(dim=1).detach(),
+                "gate_vec":  gate.detach(),
+
+                # router attention (mean over heads)
+                "attn_s_to_state": attn_s_to_state.detach(),
+                "attn_s_to_text":  attn_s_to_text.detach(),
+                "attn_t_to_state": attn_t_to_state.detach(),
+                "attn_t_to_text":  attn_t_to_text.detach(),
+
+                # raw head weights
+                "w_s": w_s.detach(),
+                "w_t": w_t.detach(),
+
+                # learnable queries
+                "q_state_tok": self.q_state_tok.detach().clone(),
+                "q_text_tok":  self.q_text_tok.detach().clone(),
+
+                # NEW: entropy stats (로깅용 detach)
+                "attn_entropy": attn_entropy.detach(),
+                "attn_entropy_s": ent_s.detach(),
+                "attn_entropy_t": ent_t.detach(),
+
+                "attn_entropy_penalty": attn_entropy_penalty,
+            }
+            return q, aux
+
         return q
+    
 
-
-class BertNetCQL(nn.Module):
+class TextNetCQL(nn.Module):
     def __init__(
         self,
         num_actions: int,
@@ -168,24 +259,24 @@ class BertNetCQL(nn.Module):
         activation: str = 'relu',
         note_emb_dim: int = 768
     ):
-        super(BertNetCQL, self).__init__()
-        # Note embedding projection
+        super(TextNetCQL, self).__init__()
+        # --- Note embedding projection ---
         self.note_proj1 = nn.Linear(note_emb_dim, hidden_node)
         self.note_bn1   = nn.BatchNorm1d(hidden_node)
         self.note_proj2 = nn.Linear(hidden_node, hidden_node)
         self.note_bn2   = nn.BatchNorm1d(hidden_node)
 
-        # Shared feature branch
+        # --- Shared feature branch ---
         self.share_q    = nn.Linear(hidden_node, hidden_node)
         self.share_bn   = nn.BatchNorm1d(hidden_node)
 
-        # Dueling: Value branch
+        # --- Dueling: Value branch ---
         self.value_q1   = nn.Linear(hidden_node, hidden_node)
         self.value_bn1  = nn.BatchNorm1d(hidden_node)
         self.value_q2   = nn.Linear(hidden_node, 1)
         self.value_bn2  = nn.BatchNorm1d(1)
 
-        # Dueling: Advantage branch
+        # --- Dueling: Advantage branch ---
         self.adv_q1     = nn.Linear(hidden_node, hidden_node)
         self.adv_bn1    = nn.BatchNorm1d(hidden_node)
         self.adv_q2     = nn.Linear(hidden_node, num_actions)
@@ -200,29 +291,128 @@ class BertNetCQL(nn.Module):
             raise ValueError(f"Unsupported activation: {activation}")
 
     def forward(self, note_emb: torch.Tensor) -> torch.Tensor:
-        # embedding projection
+        # 1) embedding projection
         x = self.act(self.note_bn1(self.note_proj1(note_emb)))
         x = self.act(self.note_bn2(self.note_proj2(x)))
 
-        # shared features
+        # 2) shared features
         x = self.act(self.share_bn(self.share_q(x)))
 
-        # value stream
+        # 3) value stream
         v = self.act(self.value_bn1(self.value_q1(x)))
         v = self.act(self.value_bn2(self.value_q2(v)))  # [B,1]
 
-        # advantage stream
+        # 4) advantage stream
         adv = self.act(self.adv_bn1(self.adv_q1(x)))
         adv = self.act(self.adv_bn2(self.adv_q2(adv))) # [B,A]
 
-        # dueling combine
+        # 5) dueling combine
         adv_mean = adv.mean(dim=1, keepdim=True)       # [B,1]
         q = v + adv - adv_mean                         # [B,A]
         return q
 
 
+# class IQLActor(nn.Module):
+#     """Actor (Policy) Model."""
+
+#     def __init__(self, state_dim, num_actions, hidden_node, activation='relu'):
+#         super(IQLActor, self).__init__()
+       
+#         self.fc1 = nn.Linear(state_dim, hidden_node)
+#         self.bn1 = nn.BatchNorm1d(num_features=hidden_node)
+#         self.fc2 = nn.Linear(hidden_node, hidden_node)
+#         self.bn2 = nn.BatchNorm1d(num_features=hidden_node)
+#         self.fc3 = nn.Linear(hidden_node, num_actions)
+
+#     def forward(self, state):
+
+#         x = F.relu(self.bn1(self.fc1(state)))
+#         x = F.relu(self.bn2(self.fc2(x)))
+#         action_logits = self.fc3(x)
+#         return action_logits
+    
+    
+
+
+# class IQLCritic(nn.Module):
+#     """Dueling IQL Critic using BCQNet-style layers."""
+#     def __init__(self, state_dim, num_actions, hidden_node, activation='relu'):
+#         super(IQLCritic, self).__init__()
+#         # shared backbone
+#         self.share_q = nn.Linear(state_dim, hidden_node)
+#         self.share_bn = nn.BatchNorm1d(num_features=hidden_node)
+        
+#         # value stream
+#         self.value_q1 = nn.Linear(hidden_node, hidden_node)
+#         self.value_bn1 = nn.BatchNorm1d(num_features=hidden_node)
+#         self.value_q2 = nn.Linear(hidden_node, 1)
+#         self.value_bn2 = nn.BatchNorm1d(num_features=1)
+        
+#         # advantage stream
+#         self.adv_q1 = nn.Linear(hidden_node, hidden_node)
+#         self.adv_bn1 = nn.BatchNorm1d(num_features=hidden_node)
+#         self.adv_q2 = nn.Linear(hidden_node, num_actions)
+#         self.adv_bn2 = nn.BatchNorm1d(num_features=num_actions)
+        
+#         # activation 
+#         if activation.lower() == 'relu':
+#             self.activation = F.relu
+#         elif activation.lower() == 'tanh':
+#             self.activation = F.tanh
+#         else:
+#             raise ValueError(f"Unsupported activation: {activation}")
+
+#     def forward(self, state):
+#         # shared feature encoding
+#         x = self.activation(self.share_bn(self.share_q(state)))
+        
+#         # value head
+#         v = self.activation(self.value_bn1(self.value_q1(x)))
+#         v = self.activation(self.value_bn2(self.value_q2(v)))  # shape [B,1]
+        
+#         # advantage head
+#         a = self.activation(self.adv_bn1(self.adv_q1(x)))
+#         a = self.activation(self.adv_bn2(self.adv_q2(a)))      # shape [B,A]
+        
+#         # dueling combine
+#         a_mean = a.mean(dim=1, keepdim=True)                  # shape [B,1]
+#         q = v + (a - a_mean)                                   # shape [B,A]
+#         return q
+    
+
+# class IQLValue(nn.Module):
+#     """Value network in BCQNet style (no dueling)."""
+#     def __init__(self, state_dim, hidden_node, activation='relu'):
+#         super(IQLValue, self).__init__()
+#         # shared encoder (same as BCQNet share layers)
+#         self.share_q = nn.Linear(state_dim, hidden_node)
+#         self.share_bn = nn.BatchNorm1d(num_features=hidden_node)
+        
+#         # value stream (reuse BCQNet’s value layers)
+#         self.value_q1 = nn.Linear(hidden_node, hidden_node)
+#         self.value_bn1 = nn.BatchNorm1d(num_features=hidden_node)
+#         self.value_q2 = nn.Linear(hidden_node, 1)
+#         self.value_bn2 = nn.BatchNorm1d(num_features=1)
+        
+#         # activation 
+#         if activation.lower() == 'relu':
+#             self.activation = F.relu
+#         elif activation.lower() == 'tanh':
+#             self.activation = F.tanh
+#         else:
+#             raise ValueError(f"Unsupported activation: {activation}")
+
+#     def forward(self, state):
+#         # shared encoding
+#         x = self.activation(self.share_bn(self.share_q(state)))
+#         # value head
+#         x = self.activation(self.value_bn1(self.value_q1(x)))
+#         v = self.value_bn2(self.value_q2(x))  
+#                                              
+#         return v
 
 class CQLNet(torch.nn.Module):
+    """Dueling Q-network with Batch Normalization for discrete actions"""
     def __init__(self, state_dim, num_actions, hidden_node, activation='relu'):
         super(CQLNet, self).__init__()
         # Shared layers
