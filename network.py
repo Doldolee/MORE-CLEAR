@@ -5,28 +5,43 @@ import math
 import numpy as np
 
 
-class FeatureMixerBlock(nn.Module):
-    """
-    MLP-Mixer style feature-mixing block for hidden-dimension state data.
-    Only mixes across feature dimension to avoid batch-size dependence.
-    Outputs maintain hidden_dim size.
-    """
-    def __init__(self, hidden_dim):
+class NumericFeatureTokenizer(nn.Module):
+    """x: [B,S] -> T: [B,S,C] with T_j = b_j + x_j * W_j"""
+    def __init__(self, n_features, d):
         super().__init__()
-        # feature-mixing across feature dimension
-        self.feature_mlp = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, hidden_dim)
-        )
-        self.norm = nn.LayerNorm(hidden_dim)
+        self.W = nn.Parameter(torch.randn(n_features, d))
+        self.b = nn.Parameter(torch.zeros(n_features, d))
 
     def forward(self, x):
-        # x: [batch, hidden_dim]
-        residual = x
-        v = self.feature_mlp(x)
-        x = residual + v
-        x = self.norm(x)
+        # x: [B,S]
+        return x.unsqueeze(-1) * self.W.unsqueeze(0) + self.b.unsqueeze(0)
+
+
+class MixerBlock(nn.Module):
+    """MLP-Mixer block with token-mixing and channel-mixing MLPs."""
+    def __init__(self, n_features, d, token_expansion=2, channel_expansion=4):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(d)
+        self.token_mlp = nn.Sequential(
+            nn.Linear(n_features, token_expansion * n_features),
+            nn.GELU(),
+            nn.Linear(token_expansion * n_features, n_features),
+        )
+        self.norm2 = nn.LayerNorm(d)
+        self.channel_mlp = nn.Sequential(
+            nn.Linear(d, channel_expansion * d),
+            nn.GELU(),
+            nn.Linear(channel_expansion * d, d),
+        )
+
+    def forward(self, x):
+        # x: [B,S,C]
+        y = self.norm1(x).transpose(1, 2)   # [B,C,S]
+        y = self.token_mlp(y).transpose(1, 2)
+        x = x + y                           # token mixing
+
+        y = self.channel_mlp(self.norm2(x))
+        x = x + y                           # channel mixing
         return x
     
 
@@ -63,12 +78,12 @@ class CQLContextGatedFusionMixerNet(nn.Module):
         self.ctx_bn2    = nn.BatchNorm1d(hidden_node)
 
         # -----------------------------
-        # State projection + mixers
+        # State tokenizer + MLP-Mixer blocks
         # -----------------------------
-        self.state_proj = nn.Linear(state_dim, hidden_node)
-        self.state_bn0  = nn.BatchNorm1d(hidden_node)
-        self.state_mixer1 = FeatureMixerBlock(hidden_dim=hidden_node)
-        self.state_mixer2 = FeatureMixerBlock(hidden_dim=hidden_node)
+        self.state_tokenizer = NumericFeatureTokenizer(n_features=state_dim, d=hidden_node)
+        self.state_mixer1 = MixerBlock(n_features=state_dim, d=hidden_node)
+        self.state_mixer2 = MixerBlock(n_features=state_dim, d=hidden_node)
+        self.state_out_norm = nn.LayerNorm(hidden_node)
 
         # -----------------------------
         # Gated fusion (note vs context)
@@ -144,11 +159,12 @@ class CQLContextGatedFusionMixerNet(nn.Module):
         x_ctx  = self.act(self.ctx_bn2(self.ctx_proj2(x_ctx)))
 
         # -----------------------------
-        # Project state and apply feature mixers
+        # Tokenize state and apply MLP-Mixer blocks
         # -----------------------------
-        x_state = self.act(self.state_bn0(self.state_proj(state)))
-        x_state = self.state_mixer1(x_state)
-        x_state = self.state_mixer2(x_state)
+        x_state_tokens = self.state_tokenizer(state)              # (B, S, H)
+        x_state_tokens = self.state_mixer1(x_state_tokens)
+        x_state_tokens = self.state_mixer2(x_state_tokens)
+        x_state = self.state_out_norm(x_state_tokens).mean(dim=1) # (B, H)
 
         # -----------------------------
         # Gated fusion
