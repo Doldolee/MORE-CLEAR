@@ -19,7 +19,7 @@ class NumericFeatureTokenizer(nn.Module):
 
 class MixerBlock(nn.Module):
     """MLP-Mixer block with token-mixing and channel-mixing MLPs."""
-    def __init__(self, n_features, d, token_expansion=2, channel_expansion=4):
+    def __init__(self, n_features, d, token_expansion=2, channel_expansion=2):
         super().__init__()
         self.norm1 = nn.LayerNorm(d)
         self.token_mlp = nn.Sequential(
